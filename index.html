@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Invisibility Cloak — Camera Init Fix (Final)</title>
+  <style>
+    :root { --bg:#071528; --card:#0f1720; --muted:#9aa4b2; --accent:#e14d4d; }
+    body { margin:0; min-height:100vh; display:flex; align-items:flex-start; justify-content:center; background:linear-gradient(180deg,#02121a 0%,#071524 100%); color:#e6eef6; font-family:Inter, system-ui, -apple-system, Roboto, 'Segoe UI', Arial; }
+    .wrap { width:100%; max-width:1024px; padding:20px; box-sizing:border-box; }
+    header { display:flex; align-items:center; gap:12px; }
+    h1 { margin:0; font-size:20px; }
+    .card { background:var(--card); border-radius:12px; padding:14px; margin-top:14px; box-shadow:0 6px 20px rgba(0,0,0,.6); }
+    .row { display:flex; gap:8px; align-items:center; justify-content:center; flex-wrap:wrap; }
+    video, canvas { border-radius:8px; width:640px; height:480px; background:#000; box-shadow:0 4px 18px rgba(0,0,0,.6); }
+    .controls { display:flex; gap:8px; margin-top:12px; justify-content:center; flex-wrap:wrap; }
+    button, select { background:var(--accent); color:#fff; border:none; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
+    button.ghost { background:transparent; border:1px solid rgba(255,255,255,.06); }
+    button.secondary { background:#2b7a9b; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    select { padding:8px 10px; background:#081826; color:#e6eef6; }
+    .status { margin-top:10px; color:var(--muted); text-align:center; }
+    .muted { color:var(--muted); }
+    pre { white-space:pre-wrap; word-break:break-word; font-size:13px; color:#cfe9ff; background:rgba(255,255,255,.02); padding:8px; border-radius:8px; }
+    .error { color:#ffb4b4; }
+    .hint { font-size:13px; color:var(--muted); text-align:center; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>🧙 Invisibility Cloak — Camera Init Fix (Final)</h1>
+    </header>
+
+    <div class="card">
+      <div id="status" class="status">Initializing…</div>
+      <div class="hint">Tip: Serve this page via <code>http://localhost</code> (e.g. <code>python -m http.server</code>) or HTTPS. Browsers may block camera access on <code>file://</code>.</div>
+
+      <div class="row" style="margin-top:10px;">
+        <label class="muted">Camera:</label>
+        <select id="deviceSelect"><option value="">Default</option></select>
+        <button id="requestCameraBtn" class="ghost">Request Camera</button>
+        <label style="display:inline-block">
+          <input id="fileInput" type="file" accept="video/*" style="display:none" />
+          <button id="chooseFileBtn" class="secondary">Choose Video</button>
+        </label>
+        <button id="runTestsBtn" class="ghost">Run Test Suite</button>
+      </div>
+
+      <div style="display:flex;gap:12px;justify-content:center;margin-top:12px;flex-wrap:wrap;">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="output"></canvas>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn" disabled>Start Cloak</button>
+        <button id="stopBtn" disabled class="secondary">Stop</button>
+        <button id="diagBtn" class="ghost">Run Diagnostics</button>
+        <button id="testCameraBtn" class="ghost">Test Camera Access</button>
+        <button id="downloadBtn" class="secondary">Download Last Frame</button>
+      </div>
+
+      <div style="margin-top:12px;text-align:center;color:var(--muted);font-size:13px">If camera access fails: allow camera permission, close other apps using the camera, and ensure you use a secure origin (localhost/HTTPS).</div>
+
+      <div style="margin-top:12px;"><pre id="diagPre">Diagnostics will appear here.</pre></div>
+    </div>
+  </div>
+
+  <!-- Hook Module.onRuntimeInitialized before loading OpenCV.js -->
+  <script>
+    window.Module = window.Module || {};
+    const cvReady = new Promise((resolve, reject) => {
+      // Resolve when onRuntimeInitialized executes
+      window.Module.onRuntimeInitialized = function () { console.info('OpenCV runtime ready'); resolve(); };
+      // If OpenCV fails to load within 20s, reject the promise
+      setTimeout(() => reject(new Error('OpenCV.js did not load within 20s')), 20000);
+    });
+  </script>
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+  <script>
+    // Elements
+    const deviceSelect = document.getElementById('deviceSelect');
+    const requestCameraBtn = document.getElementById('requestCameraBtn');
+    const chooseFileBtn = document.getElementById('chooseFileBtn');
+    const fileInput = document.getElementById('fileInput');
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('output');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const diagBtn = document.getElementById('diagBtn');
+    const testCameraBtn = document.getElementById('testCameraBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const runTestsBtn = document.getElementById('runTestsBtn');
+    const statusEl = document.getElementById('status');
+    const diagPre = document.getElementById('diagPre');
+
+    // State
+    let stream = null;
+    let streaming = false;
+    let usingFile = false;
+    let currentFileURL = null;
+    let lastFrameBlobURL = null;
+
+    // OpenCV Mats
+    let cap=null, frame=null, hsv=null, mask1=null, mask2=null, cloakMask=null, inverseMask=null, cloakArea=null, nonCloakArea=null, finalOutput=null, background=null;
+
+    // Helpers
+    function setStatus(txt, isError=false) { statusEl.textContent = txt; statusEl.classList.toggle('error', !!isError); }
+    function setDiag(txt) { diagPre.textContent = txt; }
+
+    function stopAllTracks() {
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (currentFileURL) { URL.revokeObjectURL(currentFileURL); currentFileURL = null; }
+      video.srcObject = null; video.src = '';
+      usingFile = false;
+    }
+
+    function updateUIState() {
+      const canStart = (stream || usingFile) && (typeof cv !== 'undefined');
+      startBtn.disabled = !canStart;
+      stopBtn.disabled = !streaming;
+    }
+
+    const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    const isSecureContext = (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+
+    // Populate available video devices
+    async function populateDeviceList() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) { setDiag('enumerateDevices not supported'); return; }
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoInputs = devices.filter(d => d.kind === 'videoinput');
+        deviceSelect.innerHTML = '<option value="">Default</option>';
+        videoInputs.forEach((d,i) => {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || ('Camera ' + (i+1));
+          deviceSelect.appendChild(opt);
+        });
+        setDiag('Found ' + videoInputs.length + ' video input(s). (Labels may be empty until permission is granted)');
+      } catch (err) {
+        setDiag('Error enumerating devices: ' + (err && err.message ? err.message : String(err)));
+      }
+    }
+
+    // Initialize camera on user gesture
+    async function initCamera(deviceId) {
+      stopAllTracks();
+
+      if (!hasGetUserMedia) {
+        setStatus('getUserMedia is not supported in this browser.', true);
+        updateUIState();
+        return;
+      }
+      if (!isSecureContext) {
+        setStatus('Insecure origin (file://). Serve via http://localhost or HTTPS to access the camera.', true);
+        updateUIState();
+        return;
+      }
+
+      setStatus('Requesting camera permission — please allow in the browser prompt.');
+
+      const constraints = deviceId ? { video: { deviceId: { exact: deviceId } } } : { video: { width:640, height:480 } };
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        // Wait for usable video state
+        await new Promise((resolve) => {
+          if (video.readyState >= 2) return resolve();
+          const onCanPlay = () => { video.removeEventListener('canplay', onCanPlay); resolve(); };
+          video.addEventListener('canplay', onCanPlay);
+          // fallback timeout
+          setTimeout(resolve, 3000);
+        });
+        canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 480;
+        usingFile = false;
+        setStatus('Camera acquired. Click Start Cloak to begin.');
+        updateUIState();
+        await populateDeviceList();
+      } catch (err) {
+        console.error('Camera init error', err);
+        let msg = 'Unknown camera error. Make sure camera is connected and not in use.';
+        if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.name === 'SecurityError')) {
+          msg = 'Permission denied. Allow camera in site settings or reload and accept the prompt.';
+        } else if (err && err.name === 'NotFoundError') {
+          msg = 'No camera found. Connect a camera and try again.';
+        } else if (err && (err.name === 'NotReadableError' || err.name === 'TrackStartError')) {
+          msg = 'Camera is in use by another application. Close other apps and retry.';
+        } else if (err && err.name === 'OverconstrainedError') {
+          msg = 'Requested constraints cannot be satisfied by the selected camera. Try Default camera.';
+        } else {
+          msg = 'Camera error: ' + (err && err.message ? err.message : String(err)) + '\nIf running from file://, serve via http://localhost or HTTPS.';
+        }
+        setStatus(msg, true);
+        try { await populateDeviceList(); } catch(e){}
+        updateUIState();
+      }
+    }
+
+    requestCameraBtn.addEventListener('click', async () => {
+      await initCamera(deviceSelect.value || undefined);
+    });
+
+    // Local file fallback
+    chooseFileBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0]; if (!file) return;
+      stopAllTracks(); usingFile = true;
+      if (currentFileURL) URL.revokeObjectURL(currentFileURL);
+      currentFileURL = URL.createObjectURL(file);
+      video.srcObject = null; video.src = currentFileURL; video.play();
+      video.addEventListener('loadedmetadata', () => { canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 480; setStatus('Using local video file. Click Start Cloak.'); updateUIState(); }, { once:true });
+    });
+
+    // Diagnostics
+    diagBtn.addEventListener('click', async () => {
+      const lines = [];
+      lines.push('User agent: ' + navigator.userAgent);
+      lines.push('Secure context: ' + isSecureContext);
+      lines.push('getUserMedia supported: ' + hasGetUserMedia);
+      if (navigator.permissions && navigator.permissions.query) {
+        try { const p = await navigator.permissions.query({ name: 'camera' }); lines.push('Permissions.camera: ' + p.state); } catch(e) { lines.push('Permissions API camera: not available'); }
+      } else { lines.push('Permissions API: not available'); }
+      try { const devices = await navigator.mediaDevices.enumerateDevices(); const v = devices.filter(d => d.kind === 'videoinput'); lines.push('Video inputs: ' + v.length); v.forEach((d,i)=> lines.push('  ' + (d.label || ('Camera '+(i+1))) + ' id=' + d.deviceId)); } catch(e) { lines.push('enumerateDevices error: ' + (e && e.message ? e.message : String(e))); }
+      setDiag(lines.join('\n'));
+    });
+
+    // Quick camera permission test (user gesture required)
+    testCameraBtn.addEventListener('click', async () => {
+      setStatus('Attempting to open camera briefly for test — you will see a permission prompt.');
+      try {
+        const tStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+        tStream.getTracks().forEach(t => t.stop());
+        setStatus('Camera access test: SUCCESS. You can now Request Camera to use it in the app.');
+      } catch (err) {
+        console.error('Camera test error', err);
+        setStatus('Camera access test: FAILED — ' + (err && err.name ? err.name + ': ' + err.message : String(err)), true);
+      }
+    });
+
+    // Test Suite (adds simple test cases as requested)
+    runTestsBtn.addEventListener('click', async () => {
+      const results = [];
+      results.push({ name:'Secure origin', ok:isSecureContext, hint:isSecureContext? 'OK' : 'Serve via localhost/HTTPS' });
+      results.push({ name:'getUserMedia supported', ok:hasGetUserMedia, hint:hasGetUserMedia? 'OK' : 'Use latest Chrome/Edge/Firefox' });
+      try { const devs = await navigator.mediaDevices.enumerateDevices(); results.push({ name:'enumerateDevices', ok:true, hint:'Found ' + devs.filter(d=>d.kind==='videoinput').length + ' video input(s)' }); } catch(e) { results.push({ name:'enumerateDevices', ok:false, hint: e.message || String(e) }); }
+      results.push({ name:'OpenCV loaded', ok: (typeof cv !== 'undefined'), hint: (typeof cv !== 'undefined')? ('version: '+(cv.VERSION||'unknown')) : 'OpenCV.js not loaded' });
+      const summary = results.map(r => (r.ok? 'PASS: ' : 'FAIL: ') + r.name + ' — ' + r.hint).join('\n');
+      setDiag(summary + '\n\nTip: If OpenCV not loaded, wait until the top status shows "OpenCV ready".');
+    });
+
+    // Start cloak processing
+    startBtn.addEventListener('click', async () => {
+      if (streaming) return;
+      if (typeof cv === 'undefined') { setStatus('OpenCV not ready yet. Wait a moment and try again.', true); return; }
+      if (!stream && !usingFile) { setStatus('No camera or file available. Click Request Camera or Choose Video.', true); return; }
+
+      try {
+        await cvReady; // ensure OpenCV runtime
+        if (!video.videoWidth || !video.videoHeight) {
+          await new Promise(r => { video.addEventListener('loadedmetadata', r, { once:true }); setTimeout(r, 2000); });
+        }
+        const width = video.videoWidth || 640; const height = video.videoHeight || 480;
+
+        cap = new cv.VideoCapture(video);
+        frame = new cv.Mat(height, width, cv.CV_8UC4);
+        hsv = new cv.Mat(height, width, cv.CV_8UC3);
+        mask1 = new cv.Mat(height, width, cv.CV_8UC1);
+        mask2 = new cv.Mat(height, width, cv.CV_8UC1);
+        cloakMask = new cv.Mat(height, width, cv.CV_8UC1);
+        inverseMask = new cv.Mat(height, width, cv.CV_8UC1);
+        cloakArea = new cv.Mat(height, width, cv.CV_8UC4);
+        nonCloakArea = new cv.Mat(height, width, cv.CV_8UC4);
+        finalOutput = new cv.Mat(height, width, cv.CV_8UC4);
+
+        setStatus('Capturing background — please step out of the frame (≈1.5s)');
+        const tmp = new cv.Mat(height, width, cv.CV_8UC4);
+        for (let i=0;i<30;i++) { cap.read(tmp); cv.flip(tmp,tmp,1); await new Promise(r=>setTimeout(r,40)); }
+        background = tmp.clone(); tmp.delete();
+
+        streaming = true; startBtn.disabled = true; stopBtn.disabled = false; setStatus('Cloak running — press Stop to end.');
+
+        function process() {
+          if (!streaming) return;
+          try {
+            cap.read(frame);
+            cv.flip(frame, frame, 1);
+            cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
+            cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+            cv.inRange(hsv, new cv.Scalar(0,120,70), new cv.Scalar(10,255,255), mask1);
+            cv.inRange(hsv, new cv.Scalar(170,120,70), new cv.Scalar(180,255,255), mask2);
+            cv.add(mask1, mask2, cloakMask);
+            const kernel = cv.Mat.ones(3,3,cv.CV_8U);
+            cv.morphologyEx(cloakMask, cloakMask, cv.MORPH_OPEN, kernel);
+            cv.dilate(cloakMask, cloakMask, kernel);
+            cv.bitwise_not(cloakMask, inverseMask);
+            cv.bitwise_and(background, background, cloakArea, cloakMask);
+            cv.bitwise_and(frame, frame, nonCloakArea, inverseMask);
+            cv.addWeighted(cloakArea, 1, nonCloakArea, 1, 0, finalOutput);
+            cv.imshow('output', finalOutput);
+            kernel.delete();
+
+            // occasional last-frame save
+            if ((Math.floor(performance.now()/200)) % 5 === 0) {
+              try { canvas.toBlob(b => { if (lastFrameBlobURL) URL.revokeObjectURL(lastFrameBlobURL); lastFrameBlobURL = URL.createObjectURL(b); }, 'image/png'); } catch(e) {}
+            }
+          } catch (err) {
+            console.error('Processing error', err);
+            setStatus('Processing error: ' + (err && err.message ? err.message : String(err)), true);
+            stopCloak();
+            return;
+          }
+          requestAnimationFrame(process);
+        }
+
+        requestAnimationFrame(process);
+        updateUIState();
+
+      } catch (err) {
+        console.error('Start error', err);
+        setStatus('Failed to start cloak: ' + (err && err.message ? err.message : String(err)), true);
+        updateUIState();
+      }
+    });
+
+    function stopCloak() {
+      if (!streaming) return;
+      streaming = false;
+      startBtn.disabled = false; stopBtn.disabled = true; setStatus('Stopped.');
+      // release mats
+      try { frame && frame.delete(); } catch(e) {}
+      try { hsv && hsv.delete(); } catch(e) {}
+      try { mask1 && mask1.delete(); } catch(e) {}
+      try { mask2 && mask2.delete(); } catch(e) {}
+      try { cloakMask && cloakMask.delete(); } catch(e) {}
+      try { inverseMask && inverseMask.delete(); } catch(e) {}
+      try { cloakArea && cloakArea.delete(); } catch(e) {}
+      try { nonCloakArea && nonCloakArea.delete(); } catch(e) {}
+      try { finalOutput && finalOutput.delete(); } catch(e) {}
+      try { background && background.delete(); } catch(e) {}
+      frame = hsv = mask1 = mask2 = cloakMask = inverseMask = cloakArea = nonCloakArea = finalOutput = background = null;
+      updateUIState();
+    }
+
+    downloadBtn.addEventListener('click', () => {
+      if (!lastFrameBlobURL) { alert('No frame available yet — start the cloak first.'); return; }
+      const a = document.createElement('a'); a.href = lastFrameBlobURL; a.download = 'cloak_frame.png'; document.body.appendChild(a); a.click(); a.remove();
+    });
+
+    // Initial setup
+    (async () => {
+      try { await populateDeviceList(); } catch(e) {}
+      setStatus('Ready. Click "Request Camera" to allow camera access (user gesture required).');
+      updateUIState();
+    })();
+
+    // Cleanup
+    window.addEventListener('beforeunload', () => {
+      try { stopCloak(); } catch(e) {}
+      try { stopAllTracks(); } catch(e) {}
+      if (lastFrameBlobURL) URL.revokeObjectURL(lastFrameBlobURL);
+    });
+
+    // When OpenCV runtime becomes ready, update UI
+    cvReady.then(() => { setStatus('OpenCV ready. You can request the camera now.'); updateUIState(); }).catch((e)=>{ console.warn('cvReady failed', e); setStatus('OpenCV failed to load: ' + (e && e.message ? e.message : String(e)), true); });
+  </script>
+</body>
+</html>
