@@ -12,7 +12,9 @@
     h1 { margin:0; font-size:20px; }
     .card { background:var(--card); border-radius:12px; padding:14px; margin-top:14px; box-shadow:0 6px 20px rgba(0,0,0,.6); }
     .row { display:flex; gap:8px; align-items:center; justify-content:center; flex-wrap:wrap; }
-    video, canvas { border-radius:8px; width:640px; height:480px; background:#000; box-shadow:0 4px 18px rgba(0,0,0,.6); }
+    /* Hide the video element and only show the canvas */
+    video { display: none; }
+    canvas { border-radius:8px; width:640px; height:480px; background:#000; box-shadow:0 4px 18px rgba(0,0,0,.6); }
     .controls { display:flex; gap:8px; margin-top:12px; justify-content:center; flex-wrap:wrap; }
     button, select { background:var(--accent); color:#fff; border:none; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
     button.ghost { background:transparent; border:1px solid rgba(255,255,255,.06); }
@@ -101,6 +103,7 @@
     let usingFile = false;
     let currentFileURL = null;
     let lastFrameBlobURL = null;
+    let isCapturingBackground = false;
 
     // OpenCV Mats
     let cap=null, frame=null, hsv=null, mask1=null, mask2=null, cloakMask=null, inverseMask=null, cloakArea=null, nonCloakArea=null, finalOutput=null, background=null;
@@ -291,12 +294,34 @@
         nonCloakArea = new cv.Mat(height, width, cv.CV_8UC4);
         finalOutput = new cv.Mat(height, width, cv.CV_8UC4);
 
-        setStatus('Capturing background — please step out of the frame (≈1.5s)');
-        const tmp = new cv.Mat(height, width, cv.CV_8UC4);
-        for (let i=0;i<30;i++) { cap.read(tmp); cv.flip(tmp,tmp,1); await new Promise(r=>setTimeout(r,40)); }
-        background = tmp.clone(); tmp.delete();
+        setStatus('Capturing background — please stand clear (1-2 seconds)...');
+        isCapturingBackground = true;
+        
+        // Display raw video on canvas while capturing background
+        function captureBackground() {
+          if (!isCapturingBackground) return;
+          try {
+            cap.read(frame);
+            cv.flip(frame, frame, 1);
+            cv.imshow('output', frame);
+            requestAnimationFrame(captureBackground);
+          } catch (err) {
+            console.error('Background capture error', err);
+            setStatus('Failed to capture background: ' + (err && err.message ? err.message : String(err)), true);
+            stopCloak();
+          }
+        }
+        
+        captureBackground();
 
-        streaming = true; startBtn.disabled = true; stopBtn.disabled = false; setStatus('Cloak running — press Stop to end.');
+        // Wait a couple seconds, then grab final background frame and start cloak
+        setTimeout(() => {
+          isCapturingBackground = false;
+          background = frame.clone();
+          setStatus('Cloak running — press Stop to end.');
+          streaming = true; startBtn.disabled = true; stopBtn.disabled = false;
+          requestAnimationFrame(process);
+        }, 2000);
 
         function process() {
           if (!streaming) return;
@@ -331,7 +356,6 @@
           requestAnimationFrame(process);
         }
 
-        requestAnimationFrame(process);
         updateUIState();
 
       } catch (err) {
@@ -344,6 +368,7 @@
     function stopCloak() {
       if (!streaming) return;
       streaming = false;
+      isCapturingBackground = false;
       startBtn.disabled = false; stopBtn.disabled = true; setStatus('Stopped.');
       // release mats
       try { frame && frame.delete(); } catch(e) {}
