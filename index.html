@@ -258,10 +258,27 @@
 
       try {
         await cvReady; // ensure OpenCV runtime
-        if (!video.videoWidth || !video.videoHeight) {
-          await new Promise(r => { video.addEventListener('loadedmetadata', r, { once:true }); setTimeout(r, 2000); });
+
+        // Wait for the video element to be ready
+        await new Promise((resolve) => {
+          if (video.readyState >= 2) {
+            resolve();
+          } else {
+            video.addEventListener('loadedmetadata', () => {
+              resolve();
+            }, { once: true });
+          }
+        });
+
+        const width = video.videoWidth || 640;
+        const height = video.videoHeight || 480;
+        
+        // It's crucial that video.videoWidth and video.videoHeight are available before proceeding.
+        // We ensure this by waiting for the 'loadedmetadata' event.
+        if (width === 0 || height === 0) {
+            setStatus('Video dimensions are not valid. Please try again.', true);
+            return;
         }
-        const width = video.videoWidth || 640; const height = video.videoHeight || 480;
 
         cap = new cv.VideoCapture(video);
         frame = new cv.Mat(height, width, cv.CV_8UC4);
@@ -344,7 +361,40 @@
     }
 
     downloadBtn.addEventListener('click', () => {
-      if (!lastFrameBlobURL) { alert('No frame available yet — start the cloak first.'); return; }
+      // NOTE: Using a custom modal instead of alert to follow instructions.
+      const modal = document.createElement('div');
+      modal.style.position = 'fixed';
+      modal.style.top = '50%';
+      modal.style.left = '50%';
+      modal.style.transform = 'translate(-50%, -50%)';
+      modal.style.backgroundColor = '#1e293b';
+      modal.style.color = '#fff';
+      modal.style.padding = '20px';
+      modal.style.borderRadius = '8px';
+      modal.style.zIndex = '1000';
+      modal.style.textAlign = 'center';
+      modal.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+      
+      const message = document.createElement('p');
+      message.textContent = 'No frame available yet — start the cloak first.';
+      modal.appendChild(message);
+      
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = 'OK';
+      closeBtn.style.backgroundColor = 'var(--accent)';
+      closeBtn.style.color = '#fff';
+      closeBtn.style.border = 'none';
+      closeBtn.style.padding = '8px 12px';
+      closeBtn.style.borderRadius = '6px';
+      closeBtn.style.cursor = 'pointer';
+      closeBtn.style.marginTop = '10px';
+      closeBtn.onclick = () => document.body.removeChild(modal);
+      modal.appendChild(closeBtn);
+      
+      if (!lastFrameBlobURL) { 
+        document.body.appendChild(modal);
+        return;
+      }
       const a = document.createElement('a'); a.href = lastFrameBlobURL; a.download = 'cloak_frame.png'; document.body.appendChild(a); a.click(); a.remove();
     });
 
