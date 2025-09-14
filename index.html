@@ -103,7 +103,7 @@
     let usingFile = false;
     let currentFileURL = null;
     let lastFrameBlobURL = null;
-    let isCapturingBackground = false;
+    let animationId = null;
 
     // OpenCV Mats
     let cap=null, frame=null, hsv=null, mask1=null, mask2=null, cloakMask=null, inverseMask=null, cloakArea=null, nonCloakArea=null, finalOutput=null, background=null;
@@ -295,66 +295,69 @@
         finalOutput = new cv.Mat(height, width, cv.CV_8UC4);
 
         setStatus('Capturing background — please stand clear (1-2 seconds)...');
-        isCapturingBackground = true;
+        streaming = true;
         
-        // Display raw video on canvas while capturing background
-        function captureBackground() {
-          if (!isCapturingBackground) return;
+        // Main loop for background capture and cloaking
+        function mainLoop() {
           try {
             cap.read(frame);
             cv.flip(frame, frame, 1);
             cv.imshow('output', frame);
-            requestAnimationFrame(captureBackground);
-          } catch (err) {
-            console.error('Background capture error', err);
-            setStatus('Failed to capture background: ' + (err && err.message ? err.message : String(err)), true);
-            stopCloak();
-          }
-        }
-        
-        captureBackground();
-
-        // Wait a couple seconds, then grab final background frame and start cloak
-        setTimeout(() => {
-          isCapturingBackground = false;
-          background = frame.clone();
-          setStatus('Cloak running — press Stop to end.');
-          streaming = true; startBtn.disabled = true; stopBtn.disabled = false;
-          requestAnimationFrame(process);
-        }, 2000);
-
-        function process() {
-          if (!streaming) return;
-          try {
-            cap.read(frame);
-            cv.flip(frame, frame, 1);
-            cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
-            cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
-            cv.inRange(hsv, new cv.Scalar(0,120,70), new cv.Scalar(10,255,255), mask1);
-            cv.inRange(hsv, new cv.Scalar(170,120,70), new cv.Scalar(180,255,255), mask2);
-            cv.add(mask1, mask2, cloakMask);
-            const kernel = cv.Mat.ones(3,3,cv.CV_8U);
-            cv.morphologyEx(cloakMask, cloakMask, cv.MORPH_OPEN, kernel);
-            cv.dilate(cloakMask, cloakMask, kernel);
-            cv.bitwise_not(cloakMask, inverseMask);
-            cv.bitwise_and(background, background, cloakArea, cloakMask);
-            cv.bitwise_and(frame, frame, nonCloakArea, inverseMask);
-            cv.addWeighted(cloakArea, 1, nonCloakArea, 1, 0, finalOutput);
-            cv.imshow('output', finalOutput);
-            kernel.delete();
-
-            // occasional last-frame save
-            if ((Math.floor(performance.now()/200)) % 5 === 0) {
-              try { canvas.toBlob(b => { if (lastFrameBlobURL) URL.revokeObjectURL(lastFrameBlobURL); lastFrameBlobURL = URL.createObjectURL(b); }, 'image/png'); } catch(e) {}
-            }
           } catch (err) {
             console.error('Processing error', err);
             setStatus('Processing error: ' + (err && err.message ? err.message : String(err)), true);
             stopCloak();
             return;
           }
-          requestAnimationFrame(process);
+          animationId = requestAnimationFrame(mainLoop);
         }
+
+        // Start the background capture loop
+        mainLoop();
+
+        // After a delay, switch to cloaking logic
+        setTimeout(() => {
+          // Capture the background frame
+          background = frame.clone();
+          setStatus('Cloak running — press Stop to end.');
+
+          function processCloak() {
+            if (!streaming) return;
+            try {
+              cap.read(frame);
+              cv.flip(frame, frame, 1);
+              cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
+              cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+              cv.inRange(hsv, new cv.Scalar(0,120,70), new cv.Scalar(10,255,255), mask1);
+              cv.inRange(hsv, new cv.Scalar(170,120,70), new cv.Scalar(180,255,255), mask2);
+              cv.add(mask1, mask2, cloakMask);
+              const kernel = cv.Mat.ones(3,3,cv.CV_8U);
+              cv.morphologyEx(cloakMask, cloakMask, cv.MORPH_OPEN, kernel);
+              cv.dilate(cloakMask, cloakMask, kernel);
+              cv.bitwise_not(cloakMask, inverseMask);
+              cv.bitwise_and(background, background, cloakArea, cloakMask);
+              cv.bitwise_and(frame, frame, nonCloakArea, inverseMask);
+              cv.addWeighted(cloakArea, 1, nonCloakArea, 1, 0, finalOutput);
+              cv.imshow('output', finalOutput);
+              kernel.delete();
+  
+              // occasional last-frame save
+              if ((Math.floor(performance.now()/200)) % 5 === 0) {
+                try { canvas.toBlob(b => { if (lastFrameBlobURL) URL.revokeObjectURL(lastFrameBlobURL); lastFrameBlobURL = URL.createObjectURL(b); }, 'image/png'); } catch(e) {}
+              }
+            } catch (err) {
+              console.error('Processing error', err);
+              setStatus('Processing error: ' + (err && err.message ? err.message : String(err)), true);
+              stopCloak();
+              return;
+            }
+            animationId = requestAnimationFrame(processCloak);
+          }
+          // Cancel the background capture loop and start the cloaking loop
+          cancelAnimationFrame(animationId);
+          animationId = requestAnimationFrame(processCloak);
+
+        }, 2000);
 
         updateUIState();
 
@@ -368,7 +371,10 @@
     function stopCloak() {
       if (!streaming) return;
       streaming = false;
-      isCapturingBackground = false;
+      if (animationId) {
+        cancelAnimationFrame(animationId);
+        animationId = null;
+      }
       startBtn.disabled = false; stopBtn.disabled = true; setStatus('Stopped.');
       // release mats
       try { frame && frame.delete(); } catch(e) {}
