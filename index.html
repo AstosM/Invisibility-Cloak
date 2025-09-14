@@ -26,6 +26,32 @@
     pre { white-space:pre-wrap; word-break:break-word; font-size:13px; color:#cfe9ff; background:rgba(255,255,255,.02); padding:8px; border-radius:8px; }
     .error { color:#ffb4b4; }
     .hint { font-size:13px; color:var(--muted); text-align:center; margin-top:8px; }
+
+    /* Custom Modal Style */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0, 0, 0, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .modal-content {
+      background-color: #1e293b;
+      color: #fff;
+      padding: 20px;
+      border-radius: 8px;
+      text-align: center;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+      max-width: 300px;
+    }
+    .modal-content button {
+      margin-top: 15px;
+    }
   </style>
 </head>
 <body>
@@ -104,13 +130,26 @@
     let currentFileURL = null;
     let lastFrameBlobURL = null;
     let animationId = null;
-
+    
     // OpenCV Mats
     let cap=null, frame=null, hsv=null, mask1=null, mask2=null, cloakMask=null, inverseMask=null, cloakArea=null, nonCloakArea=null, finalOutput=null, background=null;
 
     // Helpers
     function setStatus(txt, isError=false) { statusEl.textContent = txt; statusEl.classList.toggle('error', !!isError); }
     function setDiag(txt) { diagPre.textContent = txt; }
+
+    function showModal(message) {
+      const modal = document.createElement('div');
+      modal.className = 'modal-overlay';
+      modal.innerHTML = `
+        <div class="modal-content">
+          <p>${message}</p>
+          <button id="modalCloseBtn" class="secondary">OK</button>
+        </div>
+      `;
+      document.body.appendChild(modal);
+      document.getElementById('modalCloseBtn').onclick = () => document.body.removeChild(modal);
+    }
 
     function stopAllTracks() {
       if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
@@ -253,6 +292,27 @@
       setDiag(summary + '\n\nTip: If OpenCV not loaded, wait until the top status shows "OpenCV ready".');
     });
 
+    // New helper to initialize all OpenCV Mat objects
+    function initializeMats(width, height) {
+      // Release old mats first if they exist
+      if (frame) {
+        frame.delete(); hsv.delete(); mask1.delete(); mask2.delete();
+        cloakMask.delete(); inverseMask.delete(); cloakArea.delete();
+        nonCloakArea.delete(); finalOutput.delete(); 
+        if (background) { background.delete(); }
+      }
+      cap = new cv.VideoCapture(video);
+      frame = new cv.Mat(height, width, cv.CV_8UC4);
+      hsv = new cv.Mat(height, width, cv.CV_8UC3);
+      mask1 = new cv.Mat(height, width, cv.CV_8UC1);
+      mask2 = new cv.Mat(height, width, cv.CV_8UC1);
+      cloakMask = new cv.Mat(height, width, cv.CV_8UC1);
+      inverseMask = new cv.Mat(height, width, cv.CV_8UC1);
+      cloakArea = new cv.Mat(height, width, cv.CV_8UC4);
+      nonCloakArea = new cv.Mat(height, width, cv.CV_8UC4);
+      finalOutput = new cv.Mat(height, width, cv.CV_8UC4);
+    }
+    
     // Start cloak processing
     startBtn.addEventListener('click', async () => {
       if (streaming) return;
@@ -263,108 +323,101 @@
         await cvReady; // ensure OpenCV runtime
 
         // Wait for the video element to be ready
-        await new Promise((resolve) => {
-          if (video.readyState >= 2) {
+        await new Promise((resolve, reject) => {
+          if (video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
             resolve();
           } else {
-            video.addEventListener('loadedmetadata', () => {
+            const onCanPlayThrough = () => {
+              video.removeEventListener('canplaythrough', onCanPlayThrough);
               resolve();
-            }, { once: true });
+            };
+            video.addEventListener('canplaythrough', onCanPlayThrough);
+            setTimeout(() => {
+              video.removeEventListener('canplaythrough', onCanPlayThrough);
+              reject(new Error('Video stream did not become ready within 5 seconds.'));
+            }, 5000);
           }
         });
+
+        // Ensure the video is playing before proceeding
+        if (video.paused) {
+            await video.play();
+        }
 
         const width = video.videoWidth || 640;
         const height = video.videoHeight || 480;
         
-        // It's crucial that video.videoWidth and video.videoHeight are available before proceeding.
-        // We ensure this by waiting for the 'loadedmetadata' event.
         if (width === 0 || height === 0) {
             setStatus('Video dimensions are not valid. Please try again.', true);
             return;
         }
-
-        cap = new cv.VideoCapture(video);
-        frame = new cv.Mat(height, width, cv.CV_8UC4);
-        hsv = new cv.Mat(height, width, cv.CV_8UC3);
-        mask1 = new cv.Mat(height, width, cv.CV_8UC1);
-        mask2 = new cv.Mat(height, width, cv.CV_8UC1);
-        cloakMask = new cv.Mat(height, width, cv.CV_8UC1);
-        inverseMask = new cv.Mat(height, width, cv.CV_8UC1);
-        cloakArea = new cv.Mat(height, width, cv.CV_8UC4);
-        nonCloakArea = new cv.Mat(height, width, cv.CV_8UC4);
-        finalOutput = new cv.Mat(height, width, cv.CV_8UC4);
+        
+        // Initialize Mats with correct dimensions
+        initializeMats(width, height);
+        
+        streaming = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        let backgroundCaptureCount = 0;
 
         setStatus('Capturing background — please stand clear (1-2 seconds)...');
-        streaming = true;
-        
-        // Main loop for background capture and cloaking
-        function mainLoop() {
-          try {
+
+        function processingLoop() {
+            if (!streaming) {
+                return;
+            }
+            
             cap.read(frame);
             cv.flip(frame, frame, 1);
-            cv.imshow('output', frame);
-          } catch (err) {
-            console.error('Processing error', err);
-            setStatus('Processing error: ' + (err && err.message ? err.message : String(err)), true);
-            stopCloak();
-            return;
-          }
-          animationId = requestAnimationFrame(mainLoop);
-        }
-
-        // Start the background capture loop
-        mainLoop();
-
-        // After a delay, switch to cloaking logic
-        setTimeout(() => {
-          // Capture the background frame
-          background = frame.clone();
-          setStatus('Cloak running — press Stop to end.');
-
-          function processCloak() {
-            if (!streaming) return;
-            try {
-              cap.read(frame);
-              cv.flip(frame, frame, 1);
-              cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
-              cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
-              cv.inRange(hsv, new cv.Scalar(0,120,70), new cv.Scalar(10,255,255), mask1);
-              cv.inRange(hsv, new cv.Scalar(170,120,70), new cv.Scalar(180,255,255), mask2);
-              cv.add(mask1, mask2, cloakMask);
-              const kernel = cv.Mat.ones(3,3,cv.CV_8U);
-              cv.morphologyEx(cloakMask, cloakMask, cv.MORPH_OPEN, kernel);
-              cv.dilate(cloakMask, cloakMask, kernel);
-              cv.bitwise_not(cloakMask, inverseMask);
-              cv.bitwise_and(background, background, cloakArea, cloakMask);
-              cv.bitwise_and(frame, frame, nonCloakArea, inverseMask);
-              cv.addWeighted(cloakArea, 1, nonCloakArea, 1, 0, finalOutput);
-              cv.imshow('output', finalOutput);
-              kernel.delete();
-  
-              // occasional last-frame save
-              if ((Math.floor(performance.now()/200)) % 5 === 0) {
-                try { canvas.toBlob(b => { if (lastFrameBlobURL) URL.revokeObjectURL(lastFrameBlobURL); lastFrameBlobURL = URL.createObjectURL(b); }, 'image/png'); } catch(e) {}
-              }
-            } catch (err) {
-              console.error('Processing error', err);
-              setStatus('Processing error: ' + (err && err.message ? err.message : String(err)), true);
-              stopCloak();
-              return;
+            
+            if (backgroundCaptureCount < 60) {
+                // Background Capture Phase
+                cv.imshow('output', frame);
+                backgroundCaptureCount++;
+                animationId = requestAnimationFrame(processingLoop);
+            } else {
+                // Cloaking Phase
+                if (!background) {
+                    background = frame.clone();
+                    setStatus('Cloak running — press Stop to end.');
+                }
+                
+                try {
+                    cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
+                    cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+                    cv.inRange(hsv, new cv.Scalar(0,120,70), new cv.Scalar(10,255,255), mask1);
+                    cv.inRange(hsv, new cv.Scalar(170,120,70), new cv.Scalar(180,255,255), mask2);
+                    cv.add(mask1, mask2, cloakMask);
+                    const kernel = cv.Mat.ones(3,3,cv.CV_8U);
+                    cv.morphologyEx(cloakMask, cloakMask, cv.MORPH_OPEN, kernel);
+                    cv.dilate(cloakMask, cloakMask, kernel);
+                    cv.bitwise_not(cloakMask, inverseMask);
+                    cv.bitwise_and(background, background, cloakArea, cloakMask);
+                    cv.bitwise_and(frame, frame, nonCloakArea, inverseMask);
+                    cv.addWeighted(cloakArea, 1, nonCloakArea, 1, 0, finalOutput);
+                    cv.imshow('output', finalOutput);
+                    kernel.delete();
+        
+                    // occasional last-frame save
+                    if ((Math.floor(performance.now()/200)) % 5 === 0) {
+                      try { canvas.toBlob(b => { if (lastFrameBlobURL) URL.revokeObjectURL(lastFrameBlobURL); lastFrameBlobURL = URL.createObjectURL(b); }, 'image/png'); } catch(e) {}
+                    }
+                } catch (err) {
+                    console.error('Processing error', err);
+                    setStatus('Processing error: ' + (err && err.message ? err.message : String(err)), true);
+                    stopCloak();
+                    return;
+                }
+                animationId = requestAnimationFrame(processingLoop);
             }
-            animationId = requestAnimationFrame(processCloak);
-          }
-          // Cancel the background capture loop and start the cloaking loop
-          cancelAnimationFrame(animationId);
-          animationId = requestAnimationFrame(processCloak);
-
-        }, 2000);
-
-        updateUIState();
+        }
+        
+        animationId = requestAnimationFrame(processingLoop);
 
       } catch (err) {
         console.error('Start error', err);
         setStatus('Failed to start cloak: ' + (err && err.message ? err.message : String(err)), true);
-        updateUIState();
+        stopCloak();
       }
     });
 
@@ -384,7 +437,7 @@
       try { cloakMask && cloakMask.delete(); } catch(e) {}
       try { inverseMask && inverseMask.delete(); } catch(e) {}
       try { cloakArea && cloakArea.delete(); } catch(e) {}
-      try { nonCloakArea && nonCloakArea.delete(); } catch(e) {}
+      try { nonCloakArea && nonClo-akArea.delete(); } catch(e) {}
       try { finalOutput && finalOutput.delete(); } catch(e) {}
       try { background && background.delete(); } catch(e) {}
       frame = hsv = mask1 = mask2 = cloakMask = inverseMask = cloakArea = nonCloakArea = finalOutput = background = null;
@@ -392,38 +445,8 @@
     }
 
     downloadBtn.addEventListener('click', () => {
-      // NOTE: Using a custom modal instead of alert to follow instructions.
-      const modal = document.createElement('div');
-      modal.style.position = 'fixed';
-      modal.style.top = '50%';
-      modal.style.left = '50%';
-      modal.style.transform = 'translate(-50%, -50%)';
-      modal.style.backgroundColor = '#1e293b';
-      modal.style.color = '#fff';
-      modal.style.padding = '20px';
-      modal.style.borderRadius = '8px';
-      modal.style.zIndex = '1000';
-      modal.style.textAlign = 'center';
-      modal.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
-      
-      const message = document.createElement('p');
-      message.textContent = 'No frame available yet — start the cloak first.';
-      modal.appendChild(message);
-      
-      const closeBtn = document.createElement('button');
-      closeBtn.textContent = 'OK';
-      closeBtn.style.backgroundColor = 'var(--accent)';
-      closeBtn.style.color = '#fff';
-      closeBtn.style.border = 'none';
-      closeBtn.style.padding = '8px 12px';
-      closeBtn.style.borderRadius = '6px';
-      closeBtn.style.cursor = 'pointer';
-      closeBtn.style.marginTop = '10px';
-      closeBtn.onclick = () => document.body.removeChild(modal);
-      modal.appendChild(closeBtn);
-      
       if (!lastFrameBlobURL) { 
-        document.body.appendChild(modal);
+        showModal('No frame available yet — start the cloak first.');
         return;
       }
       const a = document.createElement('a'); a.href = lastFrameBlobURL; a.download = 'cloak_frame.png'; document.body.appendChild(a); a.click(); a.remove();
